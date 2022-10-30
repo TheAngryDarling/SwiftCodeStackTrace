@@ -9,13 +9,109 @@ import Foundation
 
 /// Object used to keep track of stack trace items when calling functions
 public struct CodeStackTrace: BidirectionalCollection {
+    public struct ThreadDetails {
+        /// Keys for Key/Value of the Thread Description key/values
+        public enum ThreadDescripionKeys: String {
+            case number
+            case name
+        }
+        /// The Thread Object's Object Id
+        public let threadObjectId: String?
+        /// The Thread Number (From the thread description)
+        public let threadNumber: Int?
+        /// The Thread Name (From the thread description)
+        public let descriptionName: String?
+        ///  Thread Description Key/Value items
+        public let descriptionKeyValues: [String: String]
+        /// The Thread Name (From the name property)
+        public let setName: String?
+        /// The Thread Name (either .setName or .descriptionName)
+        public var name: String? {
+            return self.setName ?? self.descriptionName
+        }
+        /// The Thread Quality of Service
+        public let qualityOfService: QualityOfService
+        
+        /// Indicator if the thread was the main thread
+        ///
+        /// Note: On OpenSwift < 4.1 this field is always false
+        public let isMainThread: Bool
+        
+        public init(thread: Thread = Thread.current) {
+            
+            
+            var descriptionKeyValues: [String: String] = [:]
+            var description = "\(thread)"
+            #if _runtime(_ObjC)
+            // Open Swift does not provide any extra details within the thread description other than
+            // thread object ID
+            
+            // parse out key/value 'key = value' from description inside { ... }
+            if let startOfThreadDetails = description.range(of: "{"),
+               let endOfThreadDetails = description.range(of: "}", options: .backwards) {
+                description = String(description[startOfThreadDetails.upperBound..<endOfThreadDetails.lowerBound])
+                let descriptionValues = description.split(separator: ",").map(String.init)
+                for value in descriptionValues {
+                    if let sep = value.range(of: "=") {
+                        let key = String(value[..<sep.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        let val = String(value[sep.upperBound...]).trimmingCharacters(in: .whitespaces)
+                        
+                        if val != "null" && val != "nil" && val != "(null)" && val != "(nil)" {
+                            descriptionKeyValues[key] = val
+                        }
+                    }
+                }
+            }
+            #endif
+            
+            #if _runtime(_ObjC) || swift(>=4.1)
+            let isMainTh: Bool = Thread.isMainThread
+            #else
+            let isMainTh: Bool = false
+            #endif
+            
+            // we will set the thread description name to main if not set and thread is main thread
+            if !descriptionKeyValues.keys.contains(ThreadDescripionKeys.name.rawValue) &&
+                isMainTh {
+                descriptionKeyValues[ThreadDescripionKeys.name.rawValue] = "main"
+            }
+            
+            if !descriptionKeyValues.keys.contains(ThreadDescripionKeys.number.rawValue),
+                let tn = Int("\(pthread_self())") {
+                descriptionKeyValues[ThreadDescripionKeys.number.rawValue] = "\(tn)"
+            }
+            
+            
+            var objId: String? = nil
+            // parse out object id from description inside <OBJECTTYPE: OBJECT ID> ...
+            if description.hasPrefix("<"),
+               let colonRange = description.range(of: ":"),
+               let endOfObjectIdentRange = description.range(of: ">", range: colonRange.upperBound..<description.endIndex) {
+                objId = String(description[colonRange.upperBound..<endOfObjectIdentRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            }
+            
+            self.threadObjectId = objId
+            
+            var threadNumber: Int? = nil
+            if let stn = descriptionKeyValues[ThreadDescripionKeys.number.rawValue],
+               let tn = Int(stn) {
+                threadNumber = tn
+            }
+            self.threadNumber = threadNumber
+            self.descriptionName = descriptionKeyValues[ThreadDescripionKeys.name.rawValue]
+            self.setName = thread.name
+            self.descriptionKeyValues = descriptionKeyValues
+            self.qualityOfService = thread._stackTraceQualityOfService
+            self.isMainThread = isMainTh
+            
+        }
+    }
     /// A stack trace item which contains the path to the file, the calling function and the line
     public struct StackItem: CustomStringConvertible {
         public let filePath: String
         public let function: String
         public let line: UInt
-        public let threadName: String?
-        public let threadQOS: QualityOfService
+        public let threadDetails: ThreadDetails
         
         public var functionName: String {
             guard let r = self.function.range(of: "(") else {
@@ -24,7 +120,6 @@ public struct CodeStackTrace: BidirectionalCollection {
             return String(self.function[..<r.lowerBound])
         }
         
-        
         public var description: String {
             return "\(self.filePath):\(self.line) - \(self.function)"
         }
@@ -32,13 +127,11 @@ public struct CodeStackTrace: BidirectionalCollection {
         public init(filePath: StaticString,
                     function: StaticString,
                     line: UInt,
-                    threadName: String?,
-                    threadQOS: QualityOfService) {
+                    threadDetails: ThreadDetails = .init()) {
             self.filePath = "\(filePath)"
             self.function = "\(function)"
             self.line = line
-            self.threadName = threadName
-            self.threadQOS = threadQOS
+            self.threadDetails = threadDetails
         }
     }
     /// Indicator if stacking should occur when called
@@ -104,20 +197,17 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     public init(locked: Bool = false,
                 filePath: StaticString = #filePath,
                 function: StaticString = #function,
                 line: UInt = #line,
-                threadName: String? = Thread.current.name,
-                threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService) {
+                threadDetails: ThreadDetails = .init()) {
         self.mutable = !locked
         self.stack = [.init(filePath: filePath,
                             function: function,
                             line: line,
-                            threadName: threadName,
-                            threadQOS: threadQOS)]
+                            threadDetails: threadDetails)]
     }
     
     /// Add new stack item to the stack trace
@@ -125,18 +215,15 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     public mutating func stack(filePath: StaticString = #filePath,
                                function: StaticString = #function,
                                line: UInt = #line,
-                               threadName: String? = Thread.current.name,
-                               threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService) {
+                               threadDetails: ThreadDetails = .init()) {
         self.stack(.init(filePath: filePath,
                          function: function,
                          line: line,
-                         threadName: threadName,
-                         threadQOS: threadQOS))
+                         threadDetails: threadDetails))
     }
     
     /// Create a copy of the given stack trace and add a new stack item if the stack trace is not locked
@@ -144,22 +231,19 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     ///   - locked: optional bool to set the lockable flag of the new stack trace before stacking the new item
     /// - Returns: Returns new stack trace
     public func stacking(filePath: StaticString = #filePath,
                          function: StaticString = #function,
                          line: UInt = #line,
-                         threadName: String? = Thread.current.name,
-                         threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService,
+                         threadDetails: ThreadDetails = .init(),
                          locked: Bool? = nil) -> CodeStackTrace {
         
         return self.stacking(.init(filePath: filePath,
                                    function: function,
                                    line: line,
-                                   threadName: threadName,
-                                   threadQOS: threadQOS),
+                                   threadDetails: threadDetails),
                              locked: locked)
     }
     
@@ -170,20 +254,17 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     public init(locked: Bool = false,
                 filePath: StaticString = #file,
                 function: StaticString = #function,
                 line: UInt = #line,
-                threadName: String? = Thread.current.name,
-                threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService) {
+                threadDetails: ThreadDetails = .init()) {
         self.mutable = !locked
         self.stack = [.init(filePath: filePath,
                             function: function,
                             line: line,
-                            threadName: threadName,
-                            threadQOS: threadQOS)]
+                            threadDetails: threadDetails)]
     }
     
     /// Add new stack item to the stack trace
@@ -191,18 +272,15 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     public mutating func stack(filePath: StaticString = #file,
                                function: StaticString = #function,
                                line: UInt = #line,
-                               threadName: String? = Thread.current.name,
-                               threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService) {
+                               threadDetails: ThreadDetails = .init()) {
         self.stack(.init(filePath: filePath,
                          function: function,
                          line: line,
-                         threadName: threadName,
-                         threadQOS: threadQOS))
+                         threadDetails: threadDetails))
     }
     
     /// Create a copy of the given stack trace and add a new stack item if the stack trace is not locked
@@ -210,22 +288,19 @@ public struct CodeStackTrace: BidirectionalCollection {
     ///   - filePath: The calling file
     ///   - function: The calling function
     ///   - line: The calling line
-    ///   - threadName: The name of the thread the call was made on
-    ///   - threadQOS: The quality of service of the thread the call was made on
+    ///   - threadDetails: The working thread details
     ///   - locked: optional bool to set the lockable flag of the new stack trace before stacking the new item
     /// - Returns: Returns new stack trace
     public func stacking(filePath: StaticString = #file,
                          function: StaticString = #function,
                          line: UInt = #line,
-                         threadName: String? = Thread.current.name,
-                         threadQOS: QualityOfService = Thread.current._stackTraceQualityOfService,
+                         threadDetails: ThreadDetails = .init(),
                          locked: Bool? = nil) -> CodeStackTrace {
         
         return self.stacking(.init(filePath: filePath,
                                    function: function,
                                    line: line,
-                                   threadName: threadName,
-                                   threadQOS: threadQOS),
+                                   threadDetails: threadDetails),
                              locked: locked)
     }
     #endif
